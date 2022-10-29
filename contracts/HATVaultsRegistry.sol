@@ -43,6 +43,7 @@ contract HATVaultsRegistry is IHATVaultsRegistry, Ownable {
         uint256 hatsReceived;
         uint256 totalHackerReward;
         uint256 governanceAmountSwapped;
+        uint256[] hackerRewards_test;
     }
 
     uint256 public constant HUNDRED_PERCENT = 10000;
@@ -296,6 +297,8 @@ contract HATVaultsRegistry is IHATVaultsRegistry, Ownable {
     }
 
     /** @notice See {IHATVaultsRegistry-addTokensToSwap}. */
+    //Note: If a hacker gets a claim approved with the same project, it would compound the previous claim as long as it doesn't get decremented. Does it get decremented somewhere?
+    //Not sure what this function does
     function addTokensToSwap(
         IERC20 _asset,
         address _hacker,
@@ -319,6 +322,7 @@ contract HATVaultsRegistry is IHATVaultsRegistry, Ownable {
         // Needed to avoid a "stack too deep" error
         SwapData memory swapData;
         swapData.amount = governanceHatReward[_asset];
+        //Note: hackersHatReward[_asset][_beneficiaries[i]] gets called a lot of times from storage. can you store it in an memory array instead?
         for (uint256 i = 0; i < _beneficiaries.length; i++) {
             swapData.amount += hackersHatReward[_asset][_beneficiaries[i]];
         }
@@ -360,6 +364,69 @@ contract HATVaultsRegistry is IHATVaultsRegistry, Ownable {
         emit SwapAndSend(owner(), swapData.governanceAmountSwapped, swapData.hatsReceived - swapData.totalHackerReward, address(0));
 
     }
+
+    function swapAndSend_improved(
+        address _asset,
+        address[] calldata _beneficiaries, //Assume this is governance, committee or hacker
+        uint256 _amountOutMinimum,
+        address _routingContract,
+        bytes calldata _routingPayload
+    ) external onlyOwner {
+        // Needed to avoid a "stack too deep" error
+        // Note: calling hackersHatReward[_asset][_beneficiaries[i]] alot. would it be more gas efficient to store that in an array and keep in memory?
+        // might be more costly to create an array of N length
+        SwapData memory swapData;
+        swapData.hackerRewards_test = new uint256[](_beneficiaries.length);
+        swapData.amount = governanceHatReward[_asset];
+
+        for (uint256 i = 0; i < _beneficiaries.length; ++i) { 
+            swapData.hackerRewards_test[i] = hackersHatReward[_asset][_beneficiaries[i]];
+            swapData.amount += swapData.hackerRewards_test[i]; 
+            // unchecked {
+            //     ++i;
+            // }
+        }
+
+        if (swapData.amount == 0) revert AmountToSwapIsZero();
+        IERC20 _HAT = HAT;
+        (swapData.hatsReceived, swapData.amountUnused) = _swapTokenForHAT(IERC20(_asset), swapData.amount, _amountOutMinimum, _routingContract, _routingPayload);
+        
+        swapData.governanceAmountSwapped = (swapData.amount - swapData.amountUnused) * governanceHatReward[_asset] / swapData.amount;
+        governanceHatReward[_asset] = swapData.amountUnused * governanceHatReward[_asset] / swapData.amount;
+
+        for (uint256 i = 0; i < _beneficiaries.length; ++i) {
+            uint256 hackerReward = swapData.hatsReceived * swapData.hackerRewards_test[i] / swapData.amount;
+            uint256 hackerAmountSwapped = (swapData.amount - swapData.amountUnused) * swapData.hackerRewards_test[i] / swapData.amount;
+            swapData.totalHackerReward += hackerReward;
+            // it gets updated here
+            hackersHatReward[_asset][_beneficiaries[i]] = swapData.amountUnused * swapData.hackerRewards_test[i] / swapData.amount;
+            address tokenLock;
+            if (hackerReward > 0) {
+                // hacker gets her reward via vesting contract
+                tokenLock = tokenLockFactory.createTokenLock(
+                    address(_HAT),
+                    0x0000000000000000000000000000000000000000, //this address as owner, so it can do nothing.
+                    _beneficiaries[i],
+                    hackerReward,
+                    // solhint-disable-next-line not-rely-on-time
+                    block.timestamp, //start
+                    // solhint-disable-next-line not-rely-on-time
+                    block.timestamp + generalParameters.hatVestingDuration, //end
+                    generalParameters.hatVestingPeriods,
+                    0, // no release start
+                    0, // no cliff
+                    ITokenLock.Revocability.Disabled,
+                    true
+                );
+                _HAT.safeTransfer(tokenLock, hackerReward);
+            }
+            emit SwapAndSend(_beneficiaries[i], hackerAmountSwapped, hackerReward, tokenLock);
+        }
+        _HAT.safeTransfer(owner(), swapData.hatsReceived - swapData.totalHackerReward);
+        emit SwapAndSend(owner(), swapData.governanceAmountSwapped, swapData.hatsReceived - swapData.totalHackerReward, address(0));
+
+    }
+
 
     /** @notice See {IHATVaultsRegistry-getGeneralParameters}. */   
     function getGeneralParameters() external view returns (GeneralParameters memory) {
